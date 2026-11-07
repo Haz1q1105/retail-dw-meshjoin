@@ -1,0 +1,4 @@
+Source: UCI Machine Learning Repository, Online Retail dataset
+   https://archive.ics.uci.edu/dataset/352/online+retail
+
+   Downloaded: 7 November 2026
