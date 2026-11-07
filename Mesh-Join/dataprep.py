@@ -70,3 +70,27 @@ cust = pd.DataFrame(rows)
 cust.to_csv("Data/customer_master_data.csv", index=False)
 print("Customers:", len(cust))
 print(cust.head())
+
+# master data for the products
+CATEGORIES = ["Home Decor", "Kitchen", "Stationery", "Toys", "Seasonal Gifts","Bags", "Jewelry", "Garden", "Party", "Other"]
+SUPPLIERS = [("SUP01", "Northwind Supplies"), ("SUP02", "Atlantic Gifts Ltd"),("SUP03", "Midlands Wholesale"), ("SUP04", "Celtic Craft Co"),("SUP05", "EuroPack Partners")]
+
+# for each product keeping longest ID
+names = clean.groupby("StockCode")["Description"].agg(
+    lambda d: max(d.dropna(), key=len, default="UNKNOWN"))
+
+rows = []
+for pid, name in names.items():
+    sup_id, sup_name = SUPPLIERS[stable(pid,5)]      
+    rows.append({
+        "product_id": pid,
+        "product_name": name,
+        "product_category": CATEGORIES[ stable(pid + "cat", 10) ],  
+        "supplier_id": sup_id,
+        "supplier_name": sup_name,
+    })
+
+prod = pd.DataFrame(rows)
+prod.to_csv("Data/product_master_data.csv", index=False)
+print("Products:", len(prod))
+print(prod.head())

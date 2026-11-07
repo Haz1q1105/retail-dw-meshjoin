@@ -7,3 +7,4 @@ Cleaning: 541,909 rows before
           397,884 after
 
 Sales mode: 70.06% Online, 29.94% Periodic
+Master Data: 4,338 customers, 3,665 products
