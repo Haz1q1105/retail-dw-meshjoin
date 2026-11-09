@@ -8,3 +8,9 @@ Cleaning: 541,909 rows before
 
 Sales mode: 70.06% Online, 29.94% Periodic
 Master Data: 4,338 customers, 3,665 products
+
+MySQL structure created 
+Online sales stream data prepared
+
+Online rows: 278,740 | Periodic rows: 119,144
+Periodic groups: 48, smallest 2,482, largest 2,483

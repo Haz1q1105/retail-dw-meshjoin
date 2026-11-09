@@ -1,5 +1,7 @@
 import pandas as pd
 import hashlib
+import mysql.connector
+import getpass
 
 
 ## functions 
@@ -94,3 +96,78 @@ prod = pd.DataFrame(rows)
 prod.to_csv("Data/product_master_data.csv", index=False)
 print("Products:", len(prod))
 print(prod.head())
+
+
+RENAME = {"InvoiceNo": "transaction_id", "CustomerID": "customer_id","StockCode": "product_id", "Quantity": "quantity","UnitPrice": "unit_price", "InvoiceDate": "event_time"}
+COLS = ["transaction_id", "customer_id", "product_id", "quantity","unit_price", "event_time", "sales_mode"]
+
+sales = clean.rename(columns=RENAME)
+
+# ---------- Online stream file ----------
+online = sales[sales["sales_mode"] == "Online"]                # only online rows
+online = online.sort_values("event_time", kind="stable")       # oldest first
+online = online[COLS]                                          # only the PDF columns
+
+online.to_csv("Data/online_sales_stream.csv", index=False)
+print("Online rows:", len(online))
+
+
+# ---------- Connect to MySQL ---------
+
+conn = mysql.connector.connect(
+    host=input("Host [localhost]: ") or "localhost",
+    port=int(input("Port [3306]: ") or 3306),
+    database=input("Database [retail_dw]: ") or "retail_dw",
+    user=input("User [root]: ") or "root",
+    password=getpass.getpass("Password: "),   # typing is hidden
+)
+cur = conn.cursor()
+print("Connected to MySQL")
+
+
+# ---------- Load Master Data into MySQL ----------
+# Empty the tables first, so running this file twice does not create duplicates
+cur.execute("DELETE FROM customer_md")
+cur.executemany(
+    "INSERT INTO customer_md VALUES (%s, %s, %s, %s, %s, %s, %s)",
+    cust.values.tolist())
+
+cur.execute("DELETE FROM product_md")
+cur.executemany(
+    "INSERT INTO product_md VALUES (%s, %s, %s, %s, %s)",
+    prod.values.tolist())
+
+conn.commit()   # save -- without this MySQL throws the inserts away
+print("Customers loaded:", len(cust), "| Products loaded:", len(prod))
+
+
+# ---------- Load periodic (store) sales into the staging table ----------
+# 1. keep only store rows, oldest first
+periodic = sales[sales["sales_mode"] == "Periodic"]
+periodic = periodic.sort_values("event_time", kind="stable")[COLS].copy()
+
+# 2. cut the sorted list into 48 equal groups: 0, 1, 2 ... 47
+n = len(periodic)
+periodic["release_hour"] = [i * 48 // n for i in range(n)]
+
+# 3. MySQL wants dates as text like "2010-12-01 08:26:00"
+periodic["event_time"] = periodic["event_time"].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+# 4. insert in batches of 5000 rows (one huge insert can be too big for MySQL)
+cur.execute("DELETE FROM periodic_sales_data")
+sql = ("INSERT INTO periodic_sales_data "
+       "(transaction_id, customer_id, product_id, quantity, unit_price, "
+       "event_time, sales_mode, release_hour) "
+       "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)")
+rows = periodic.values.tolist()
+for start in range(0, n, 5000):
+    cur.executemany(sql, rows[start:start + 5000])
+conn.commit()
+
+sizes = periodic["release_hour"].value_counts()
+print("Periodic rows loaded:", n)
+print("Smallest group:", sizes.min(), "| Largest group:", sizes.max())
+
+cur.close()
+conn.close()
+print("All done ")
