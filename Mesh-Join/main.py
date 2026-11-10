@@ -4,6 +4,7 @@ Main program (PDF sections 4.3, 4.4, 6):
   PeriodicThread -> every simulated hour, releases one store group
   MeshJoinThread -> MESHJOIN + load shedding + loading into the DW
 """
+import argparse
 import csv
 import getpass
 import threading
@@ -60,6 +61,7 @@ def online_thread(csv_path):
             wait = next_time - time.perf_counter()
             if wait > 0:
                 time.sleep(wait)
+    print("[Online] the whole online file has been streamed")
 
 
 # ---------- Load shedding: write store sales to disk ----------
@@ -118,6 +120,8 @@ def periodic_thread(db, hour_seconds):
         print(f"[Periodic] hour {hour}: released {len(group)} store sales")
         hour += 1
         place_group(group, cur, conn)
+    if hour == N_GROUPS:
+        print(f"[Periodic] all {N_GROUPS} groups released")
     conn.close()
 
 
@@ -184,8 +188,28 @@ def print_status():
           f"loaded into DW={stats['loaded']}")
 
 
-# ---------- Test: peak for 14 s, then non-peak for 16 s (1 hour = 5 s) ----------
+def set_peak(on):
+    settings["peak"] = on
+    settings["speed"] = PEAK_SPEED if on else NONPEAK_SPEED
+
+
+HELP = ("Commands: online | periodic | both | peak | non-peak | status | "
+        "set-peak N | set-nonpeak N | quit")
+
+
+# ---------- Start the program ----------
 if __name__ == "__main__":
+    # settings the user can choose when starting (PDF sections 5.2 and 12)
+    ap = argparse.ArgumentParser(description="MESHJOIN near-real-time DW loader")
+    ap.add_argument("--peak-speed", type=int, default=80, help="online sales/s in peak time")
+    ap.add_argument("--nonpeak-speed", type=int, default=10, help="online sales/s in non-peak time")
+    ap.add_argument("--hour-seconds", type=float, default=60, help="real seconds in one simulated hour")
+    ap.add_argument("--start", choices=["peak", "non-peak"], default="peak", help="arrival mode at start")
+    args = ap.parse_args()
+    PEAK_SPEED, NONPEAK_SPEED = args.peak_speed, args.nonpeak_speed
+    set_peak(args.start == "peak")
+
+    # connection details + online file, asked at execution time (PDF section 6)
     db = ask_db()
     csv_path = input("Online file [Data/online_sales_stream.csv]: ") or "Data/online_sales_stream.csv"
 
@@ -198,22 +222,43 @@ if __name__ == "__main__":
     conn.commit()
     conn.close()
 
-    TEST_HOUR = 5
-    print(f"Arrival mode: peak ({PEAK_SPEED}/s), non-peak ({NONPEAK_SPEED}/s) | "
-          f"1 hour = {TEST_HOUR} s (test) | stream buffer limit = {BUFFER_LIMIT}")
+    # printed before the threads start (PDF section 6)
+    print(f"Stream arrival mode: {args.start} | peak = {PEAK_SPEED}/s, non-peak = {NONPEAK_SPEED}/s")
+    print(f"One hour = {args.hour_seconds} seconds | stream buffer limit = {BUFFER_LIMIT}")
+    print(HELP)
 
-    for target, args in ((online_thread, (csv_path,)),
-                         (periodic_thread, (db, TEST_HOUR)),
-                         (meshjoin_thread, (db,))):
-        threading.Thread(target=target, args=args, daemon=True).start()
+    threads = [threading.Thread(target=online_thread, args=(csv_path,), daemon=True),
+               threading.Thread(target=periodic_thread, args=(db, args.hour_seconds), daemon=True),
+               threading.Thread(target=meshjoin_thread, args=(db,), daemon=True)]
+    for t in threads:
+        t.start()
 
-    for _ in range(7):                       # 14 s of PEAK
-        time.sleep(2)
-        print_status()
-    settings["peak"], settings["speed"] = False, NONPEAK_SPEED
-    print("---- switched to NON-PEAK ----")
-    for _ in range(8):                       # 16 s of NON-PEAK
-        time.sleep(2)
-        print_status()
+    # the remote control: keep accepting commands until quit (PDF section 6.1)
+    while True:
+        cmd = input().strip().lower()
+        if cmd in ("online", "periodic", "both"):
+            settings["mode"] = cmd
+        elif cmd == "peak":
+            set_peak(True)
+        elif cmd == "non-peak":
+            set_peak(False)
+        elif cmd.startswith("set-peak ") or cmd.startswith("set-nonpeak "):
+            name, value = cmd.split()
+            if name == "set-peak":
+                PEAK_SPEED = int(value)
+            else:
+                NONPEAK_SPEED = int(value)
+            set_peak(settings["peak"])           # apply the new speed now
+        elif cmd == "quit":
+            break
+        elif cmd != "status":
+            print(HELP)
+            continue
+        print_status()                            # every command shows the result
+
     stop_event.set()
-    print("Stopped.")
+    for t in threads:
+        t.join(timeout=5)
+    print(f"Stopped. Shed to disk in peak: {stats['shed_to_disk']} | "
+          f"shed processed back in non-peak: {stats['shed_back']} | "
+          f"loaded into DW: {stats['loaded']}")
