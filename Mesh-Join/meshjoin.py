@@ -79,7 +79,7 @@ class MeshJoin:
                     del H[key]          # throw away empty trays
 
     # ----- One full round (PDF section 4.2) -----
-    def run_round(self):
+    def run_round(self, chunk=None):
         # 1. disk buffer: load the NEXT page of each book (loop back after the last)
         cust_disk = read_page(self.cur, "customer_md", "customer_id", self.cust_page)
         prod_disk = read_page(self.cur, "product_md", "product_id", self.prod_page)
@@ -88,7 +88,9 @@ class MeshJoin:
         self.prod_page = (self.prod_page + 1) % self.n_prod_pages
 
         # 2. take a new bundle from the line onto the desk
-        chunk = self.take_chunk()
+        #    (main.py hands us the chunk; the small test takes it from our own line)
+        if chunk is None:
+            chunk = self.take_chunk()
         if chunk:
             self.add_chunk(chunk)
 

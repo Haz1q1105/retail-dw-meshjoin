@@ -1,75 +1,171 @@
-
+"""
+Main program (PDF sections 4.3, 4.4, 6):
+  OnlineThread   -> puts online sales on the counter at 80/s or 10/s
+  PeriodicThread -> every simulated hour, releases one store group
+  MeshJoinThread -> MESHJOIN + load shedding + loading into the DW
+"""
 import csv
 import getpass
 import threading
 import time
 from collections import deque
+from datetime import datetime
 
 import mysql.connector
 
+from meshjoin import MeshJoin, CHUNK_SIZE
+from loader import DWLoader, reset_dw
 
-BUFFER_LIMIT = 1000      # max sales waiting on the counter (stream buffer)
-PEAK_SPEED = 80          # sales per second in peak time
-NONPEAK_SPEED = 10       # sales per second in non-peak time
+# ---------- Settings (PDF section 12) ----------
+BUFFER_LIMIT = 1000      # counter (stream buffer) holds max 1000 sales
+STORE_MAX = 500          # store sales may use at most half -> online always has room
+PEAK_SPEED = 80          # online sales per second in peak time
+NONPEAK_SPEED = 10       # online sales per second in non-peak time
 HOUR_SECONDS = 60        # one simulated hour = 60 real seconds
-N_GROUPS = 48            # periodic groups, one released per hour
+N_GROUPS = 48            # periodic groups, one per hour
+
+# ---------- Shared things (all threads use these) ----------
+online_lane = deque()                # online sales on the counter
+store_lane = deque()                 # store sales on the counter
+lock = threading.Lock()              # only one hand on the counter at a time
+settings = {"peak": True, "speed": PEAK_SPEED, "mode": "both"}
+stats = {"hour": -1, "shed_to_disk": 0, "shed_back": 0, "loaded": 0, "in_H": 0}
+stop_event = threading.Event()
 
 
-stream_buffer = deque()              # the counter
-periodic_lane = deque()              # store sales brought in by the PeriodicThread
-buffer_lock = threading.Lock()       # only one hand on the counter at a time
-settings = {"speed": PEAK_SPEED}     # can be changed while running
-stop_event = threading.Event()       # when set -> every thread stops
+def counter_size():                  # call only while holding the lock
+    return len(online_lane) + len(store_lane)
 
 
-# Online Thread
+def connect(db):
+    return mysql.connector.connect(**db)
+
+
+# ---------- Waiter 1: OnlineThread ----------
 def online_thread(csv_path):
-    next_time = time.perf_counter()          # the timetable: when the next sale is due
+    next_time = time.perf_counter()
     with open(csv_path) as f:
         for sale in csv.DictReader(f):
-            # wait here while the counter is full
+            # wait while paused ("periodic" mode) or while the counter is full
             while not stop_event.is_set():
-                with buffer_lock:                       # take the lock
-                    if len(stream_buffer) < BUFFER_LIMIT:
-                        stream_buffer.append(sale)      # put sale on counter
-                        break                           # done, next sale
-                time.sleep(0.01)                        # full: wait a moment
+                if settings["mode"] != "periodic":
+                    with lock:
+                        if counter_size() < BUFFER_LIMIT:
+                            online_lane.append(sale)
+                            break
+                time.sleep(0.01)
             if stop_event.is_set():
                 return
-            # timetable: next sale is due 1/speed seconds after this one
             next_time = max(next_time + 1 / settings["speed"], time.perf_counter() - 1)
             wait = next_time - time.perf_counter()
-            if wait > 0:                                # ahead of schedule -> rest
-                time.sleep(wait)                        # behind -> no rest, catch up
+            if wait > 0:
+                time.sleep(wait)
+
+
+# ---------- Load shedding: write store sales to disk ----------
+def shed(cur, conn, sales):
+    now = datetime.now()
+    cur.executemany(
+        "INSERT INTO shed_table (transaction_id, customer_id, product_id, quantity, "
+        "unit_price, event_time, sales_mode, shed_time) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+        [(s["transaction_id"], s["customer_id"], s["product_id"], s["quantity"],
+          s["unit_price"], s["event_time"], s["sales_mode"], now) for s in sales])
+    conn.commit()
+    stats["shed_to_disk"] += len(sales)
+
+
+def place_group(group, cur, conn):
+    """Put a store group on the counter. What doesn't fit: peak -> shed, non-peak -> wait."""
+    to_shed = []
+    for sale in group:
+        while not stop_event.is_set():
+            with lock:
+                if counter_size() < BUFFER_LIMIT and len(store_lane) < STORE_MAX:
+                    store_lane.append(sale)
+                    break
+            if settings["peak"]:                 # can't cope -> shed to disk
+                to_shed.append(sale)
+                break
+            time.sleep(0.01)                     # quiet time -> just wait for room
+    if to_shed:
+        shed(cur, conn, to_shed)
+        print(f"[Shed] {len(to_shed)} store sales moved to shed_table (peak)")
 
 
 # ---------- Waiter 2: PeriodicThread ----------
 def periodic_thread(db, hour_seconds):
-    conn = mysql.connector.connect(**db)          # this waiter's own phone
-    cur = conn.cursor(dictionary=True)            # rows come back as {column: value}
-    for hour in range(N_GROUPS):
-        if stop_event.is_set():
-            break
-        # 1. take this hour's group (only if not released before)
+    conn = connect(db)
+    cur = conn.cursor(dictionary=True)
+    start = time.perf_counter()
+    tick = 0                                       # simulated hours passed
+    hour = 0                                       # next group to release
+    while hour < N_GROUPS and not stop_event.is_set():
+        if tick > 0:                               # group 0 goes out right away
+            wait = start + tick * hour_seconds - time.perf_counter()
+            if wait > 0 and stop_event.wait(wait):
+                break
+        tick += 1
+        if settings["mode"] == "online":           # online only: no extraction
+            continue
         cur.execute(
             "SELECT transaction_id, customer_id, product_id, quantity, unit_price, "
             "event_time, sales_mode FROM periodic_sales_data "
             "WHERE release_hour = %s AND released = 0", (hour,))
         group = cur.fetchall()
-        # 2. mark it released so it is never taken twice
-        cur.execute("UPDATE periodic_sales_data SET released = 1 "
-                    "WHERE release_hour = %s", (hour,))
+        cur.execute("UPDATE periodic_sales_data SET released = 1 WHERE release_hour = %s", (hour,))
         conn.commit()
-        # 3. bring the tray to the kitchen
-        with buffer_lock:
-            periodic_lane.extend(group)
+        stats["hour"] = hour
         print(f"[Periodic] hour {hour}: released {len(group)} store sales")
-        stop_event.wait(hour_seconds)             # sleep until the next hour
+        hour += 1
+        place_group(group, cur, conn)
+    conn.close()
+
+
+# ---------- Bring shed sales back (only when quiet) ----------
+def read_back_shed(cur, conn, n):
+    cur.execute("SELECT id, transaction_id, customer_id, product_id, quantity, unit_price, "
+                "event_time, sales_mode FROM shed_table ORDER BY id LIMIT %s", (n,))
+    rows = cur.fetchall()
+    if rows:
+        ids = [r.pop("id") for r in rows]
+        cur.execute(f"DELETE FROM shed_table WHERE id IN ({','.join(['%s'] * len(ids))})", ids)
+        conn.commit()
+        for r in rows:
+            r["processing_mode"] = "SHED"
+        stats["shed_back"] += len(rows)
+    return rows
+
+
+# ---------- The chef: MeshJoinThread ----------
+def meshjoin_thread(db):
+    conn = connect(db)
+    mj = MeshJoin(conn.cursor())
+    loader = DWLoader(conn)
+    shed_cur = conn.cursor(dictionary=True)
+    while not stop_event.is_set():
+        # priority: 1st online, 2nd store, 3rd shed (shed only in non-peak)
+        chunk = []
+        with lock:
+            while len(chunk) < CHUNK_SIZE and online_lane:
+                chunk.append(online_lane.popleft())
+            while len(chunk) < CHUNK_SIZE and store_lane:
+                chunk.append(store_lane.popleft())
+        if not settings["peak"] and len(chunk) < CHUNK_SIZE:
+            chunk += read_back_shed(shed_cur, conn, CHUNK_SIZE - len(chunk))
+
+        if not chunk and not mj.queue:             # nothing to do -> rest a moment
+            time.sleep(0.1)
+            continue
+
+        finished, _ = mj.run_round(chunk)
+        if finished:
+            stats["loaded"] += loader.load(finished)
+        stats["in_H"] = mj.sales_in_H()
     conn.close()
 
 
 def ask_db():
-    """Ask for the connection details at startup (PDF section 6)."""
+    """Connection details are asked at startup, never written in the code (PDF section 6)."""
     return {
         "host": input("Host [localhost]: ") or "localhost",
         "port": int(input("Port [3306]: ") or 3306),
@@ -79,24 +175,45 @@ def ask_db():
     }
 
 
-# ---------- Test: both waiters for 10 seconds, 1 hour = 3 seconds ----------
+def print_status():
+    with lock:
+        on, st = len(online_lane), len(store_lane)
+    print(f"[Status] mode={settings['mode']} | {'peak' if settings['peak'] else 'non-peak'} "
+          f"{settings['speed']}/s | counter={on + st} (online {on}, store {st}) | "
+          f"in H={stats['in_H']} | on shed disk={stats['shed_to_disk'] - stats['shed_back']} | "
+          f"loaded into DW={stats['loaded']}")
+
+
+# ---------- Test: peak for 14 s, then non-peak for 16 s (1 hour = 5 s) ----------
 if __name__ == "__main__":
     db = ask_db()
+    csv_path = input("Online file [Data/online_sales_stream.csv]: ") or "Data/online_sales_stream.csv"
 
-    # fresh run: mark every group as not released yet
-    conn = mysql.connector.connect(**db)
-    conn.cursor().execute("UPDATE periodic_sales_data SET released = 0")
+    # fresh run: empty the DW and the shed table, mark every group as not released
+    conn = connect(db)
+    reset_dw(conn)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM shed_table")
+    cur.execute("UPDATE periodic_sales_data SET released = 0")
     conn.commit()
     conn.close()
 
-    TEST_HOUR = 3
-    print("Peak:", PEAK_SPEED, "/s | Non-peak:", NONPEAK_SPEED, "/s | 1 hour =", TEST_HOUR, "s (test)")
-    threading.Thread(target=online_thread, args=("Data/online_sales_stream.csv",), daemon=True).start()
-    threading.Thread(target=periodic_thread, args=(db, TEST_HOUR), daemon=True).start()
+    TEST_HOUR = 5
+    print(f"Arrival mode: peak ({PEAK_SPEED}/s), non-peak ({NONPEAK_SPEED}/s) | "
+          f"1 hour = {TEST_HOUR} s (test) | stream buffer limit = {BUFFER_LIMIT}")
 
-    for second in range(1, 11):
-        time.sleep(1)
-        print(f"After {second:2}s: online on counter = {len(stream_buffer):4} | "
-              f"store sales waiting = {len(periodic_lane)}")
+    for target, args in ((online_thread, (csv_path,)),
+                         (periodic_thread, (db, TEST_HOUR)),
+                         (meshjoin_thread, (db,))):
+        threading.Thread(target=target, args=args, daemon=True).start()
+
+    for _ in range(7):                       # 14 s of PEAK
+        time.sleep(2)
+        print_status()
+    settings["peak"], settings["speed"] = False, NONPEAK_SPEED
+    print("---- switched to NON-PEAK ----")
+    for _ in range(8):                       # 16 s of NON-PEAK
+        time.sleep(2)
+        print_status()
     stop_event.set()
     print("Stopped.")
