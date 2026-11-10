@@ -8,3 +8,5 @@ __pycache__/
 # 4. Secrets
 .env
 DWH_Project.pdf
+# 6. Local file with my MySQL user/password (never commit)
+Create-DW/password.sql
