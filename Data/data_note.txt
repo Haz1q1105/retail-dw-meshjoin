@@ -1,0 +1,29 @@
+DATA NOTE
+
+Source
+  Chen, D., Sain, S. L., and Guo, K. Online Retail. UCI Machine Learning Repository.
+  https://archive.ics.uci.edu/dataset/352/online+retail
+  Downloaded: 7 November 2026
+
+Cleaning (done by Mesh-Join/dataprep.py)
+  Kept a transaction only when quantity > 0, unit price > 0, customer ID present,
+  and the invoice number does not start with C (cancellation).
+  Before: 541,909 transactions
+  After:  397,884 transactions
+
+Rules
+  stable(text, n) = MD5 of the text (UTF-8), first 8 hex characters as an integer, modulo n
+  sales_mode: stable(transaction_id, 10) is 0-6 -> Online, 7-9 -> Periodic
+  store_id:   Online -> 1, Periodic -> 2 + stable(transaction_id, 4)
+  Customer:   gender stable(id, 2); age group stable(id + "age", 7); occupation stable(id + "occ", 10);
+              city category stable(id + country, 3); stay years stable(id + "stay", 5);
+              marital status stable(id + "mar", 2)
+  Product:    name = longest Description (UNKNOWN if empty); category stable(id + "cat", 10);
+              supplier stable(id, 5)
+
+Results
+  Online:   278,740 transactions (70.06%)
+  Periodic: 119,144 transactions (29.94%)
+  Customers: 4,338 (9 partitions of 500)
+  Products:  3,665 (8 partitions of 500)
+  Periodic groups: 48 (smallest 2,482, largest 2,483)
